@@ -1,3 +1,4 @@
+import traceback
 from channels.generic.websocket import AsyncWebsocketConsumer
 import json
 from django.contrib.auth.models import User
@@ -6,6 +7,8 @@ from asgiref.sync import sync_to_async
 from urllib.parse import parse_qs
 from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework_simplejwt.exceptions import TokenError
+from django.utils import timezone
+from asgiref.sync import sync_to_async
 import asyncio
 import time
 last_seen = {}  # { username: timestamp }
@@ -94,12 +97,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 elif action == "delete":
                     await self.handle_delete(data)
 
+                elif action == "bulk_delete":
+                    await self.handle_bulk_delete(data)
+
                 elif action == "ping":
                     if hasattr(self, "username"):
                         last_seen[self.username] = time.time()
                     await self.send(text_data=json.dumps({"type": "pong"}))
 
             except Exception as e:
+                traceback.print_exc()
                 logger.error(f"WS RECEIVE ERROR: {e}")
 
     async def handle_send(self, data):
@@ -112,7 +119,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
     content=data["message"],
     is_seen=False,
     is_delivered=True   # 🔥 add this
-)
+    )
 
         payload = {
             "type": "chat_message",
@@ -138,26 +145,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def mark_seen(self, data):
         sender = data["sender"]
 
-        messages = await sync_to_async(list)(
+        # 🔥 BULK UPDATE (SAFE)
+        await sync_to_async(
             Message.objects.filter(
                 sender__username=sender,
                 receiver=self.user,
                 is_seen=False
-            )
-        )
+            ).update
+        )(is_seen=True)
 
-        for msg in messages:
-            msg.is_seen = True
-            await sync_to_async(msg.save)()
-
-            # 🔥 REAL-TIME SEEN UPDATE
-            await self.channel_layer.group_send(
-                f"user_{sender}",
-                {
-                    "type": "seen_update",
-                    "message_id": msg.id
-                }
-            )
+    # 🔥 OPTIONAL: notify sender (only once per message is overkill)
 
     async def seen_update(self, event):
         await self.send(text_data=json.dumps({
@@ -186,70 +183,123 @@ class ChatConsumer(AsyncWebsocketConsumer):
         "type": "online_users",
         "users": event["users"]
     }))
-    
+        
+    async def handle_edit(self, data):
+        try:
+            msg = await sync_to_async(
+                Message.objects.select_related("sender", "receiver").get
+            )(id=data["message_id"])
+
+        except Message.DoesNotExist:
+            return
+
+        # ❌ prevent editing others' messages
+        if msg.sender_id != self.user.id:
+            return
+
+        msg.content = data["content"]
+        msg.edited_at = timezone.now()
+        await sync_to_async(msg.save)()
+
+        payload = {
+    "type": "chat_message",
+    "event": "message_edited",
+    "message_id": msg.id,
+    "content": msg.content,
+    "edited": True,
+}
+        for user in [msg.sender.username, msg.receiver.username]:
+            await self.channel_layer.group_send(f"user_{user}", payload)
+
+
+    async def handle_delete(self, data):
+        try:
+            msg = await sync_to_async(
+                Message.objects.select_related("sender", "receiver").get
+            )(id=data["message_id"])
+
+        except Message.DoesNotExist:
+            return
+
+        if msg.sender_id != self.user.id:
+            return
+
+        sender_username = msg.sender.username
+        receiver_username = msg.receiver.username
+
+        await sync_to_async(msg.delete)()   # 🔥 HARD DELETE
+        
+        payload = {
+            "type": "chat_message",   # 🔥 MUST MATCH HANDLER
+            "event": "message_deleted",
+            "message_id": data["message_id"],
+        }
+        # print("DELETE EVENT SENT:", payload)
+
+        for user in [sender_username, receiver_username]:
+            await self.channel_layer.group_send(f"user_{user}", payload)
+
+    async def handle_bulk_delete(self, data):
+        ids = data.get("message_ids", [])
+
+        if not ids:
+            return
+
+        # ✅ get messages safely with sender/receiver preloaded
+        msgs = await sync_to_async(list)(
+            Message.objects.select_related("sender", "receiver")
+            .filter(id__in=ids, sender=self.user)
+        )
+
+        if not msgs:
+            return
+
+        # ✅ collect unique users (avoid duplicate events)
+        users = set()
+        for m in msgs:
+            users.add(m.sender.username)
+            users.add(m.receiver.username)
+
+        # ✅ delete only OWN messages
+        await sync_to_async(
+            Message.objects.filter(id__in=[m.id for m in msgs]).delete
+        )()
+
+        # ✅ single payload
+        payload = {
+            "type": "chat_message",
+            "event": "messages_deleted",
+            "message_ids": [m.id for m in msgs],
+        }
+
+        # ✅ send once per user (not per message)
+        for user in users:
+            await self.channel_layer.group_send(f"user_{user}", payload)
+
 async def cleanup_inactive():
-    while True:
-        now = time.time()
-        to_remove = []
+        while True:
+            now = time.time()
+            to_remove = []
 
-        for user, ts in last_seen.items():
-            if now - ts > 60:
-                to_remove.append(user)
+            for user, ts in last_seen.items():
+                if now - ts > 60:
+                    to_remove.append(user)
 
-        for user in to_remove:
-            online_connections.pop(user, None)
-            last_seen.pop(user, None)
+            for user in to_remove:
+                online_connections.pop(user, None)
+                last_seen.pop(user, None)
 
-        if to_remove:
-            # 🔥 broadcast update
-            from channels.layers import get_channel_layer
-            channel_layer = get_channel_layer()
+            if to_remove:
+                # 🔥 broadcast update
+                from channels.layers import get_channel_layer
+                channel_layer = get_channel_layer()
 
-            await channel_layer.group_send(
-                "global_online",
-                {
-                    "type": "online_users_update",
-                    "users": list(online_connections.keys())
-                }
-            )
+                await channel_layer.group_send(
+                    "global_online",
+                    {
+                        "type": "online_users_update",
+                        "users": list(online_connections.keys())
+                    }
+                )
 
-        await asyncio.sleep(30)
-    
-async def handle_edit(self, data):
-    msg = await sync_to_async(Message.objects.get)(id=data["message_id"])
-
-    # ❌ prevent editing others' messages
-    if msg.sender_id != self.user.id:
-        return
-
-    msg.content = data["content"]
-    msg.edited_at = timezone.now()
-    await sync_to_async(msg.save)()
-
-    payload = {
-        "type": "message_edited",
-        "message_id": msg.id,
-        "content": msg.content,
-        "edited_at": msg.edited_at.isoformat(),
-    }
-
-    await self.channel_layer.group_send(f"user_{msg.receiver.username}", payload)
-    await self.channel_layer.group_send(f"user_{msg.sender.username}", payload)
-
-
-async def handle_delete(self, data):
-    msg = await sync_to_async(Message.objects.get)(id=data["message_id"])
-
-    if msg.sender_id != self.user.id:
-        return
-
-    msg.is_deleted = True
-    await sync_to_async(msg.save)()
-
-    payload = {
-        "type": "message_deleted",
-        "message_id": msg.id,
-    }
-
-    await self.channel_layer.group_send(f"user_{msg.receiver.username}", payload)
-    await self.channel_layer.group_send(f"user_{msg.sender.username}", payload)
+            await asyncio.sleep(30)
